@@ -1,4 +1,4 @@
-# 🎙️ Voice-Based Concept Understanding Analyser (VBCUA)
+# 🎙️ Voice-Based Concept Understanding Analyser
 
 > An AI-powered Streamlit application that evaluates a student's conceptual understanding from a
 > spoken explanation, using speech-to-text, semantic similarity analysis and audio-feature-based
@@ -491,12 +491,9 @@ raw tracebacks go to the terminal only.
 
 **Team**
 
-1. Geetha Pati
-2. Vijay Kumar Nangana
+1. Shaik Ishak Baba
+2. Vijay Kumar Nangan
 3. Pavani Lakshmi Gonthina
-4. Tejaswini Veera Yenugula
-5. Poojitha Pravallika Pedapatruni
-
 ---
 
 ## 🔮 16. Future Enhancements
