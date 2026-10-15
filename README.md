@@ -187,7 +187,7 @@ sudo apt update && sudo apt install ffmpeg
 
 ```bash
 # 1. Clone
-git clone https://github.com/PatiGeetha/Voice-Based-Concept-Understanding-Analyser.git
+git clone https://github.com/Ishak-u/VoxConcept-Voice-Based-Concept-Understanding-Evaluation.git
 cd Voice-Based-Concept-Understanding-Analyser
 
 # 2. Create and activate a virtual environment
