@@ -16,9 +16,10 @@ import streamlit as st
 import ui
 from config import ALLOWED_AUDIO_TYPES, Settings
 from database import sha256_bytes
+from rag import build_context, ingest_pdf, retrieve
 
 
-def render(settings: Settings) -> None:
+def render(settings: Settings, database=None) -> None:
     ui.hero(
         "Upload or record the student's answer",
         "Provide a spoken explanation and the expected answer it should be compared against.",
@@ -107,7 +108,91 @@ def render(settings: Settings) -> None:
             st.audio(st.session_state["audio"])
 
     with col_right:
-        st.markdown("### 2. Expected answer")
+        st.markdown("### 2. Study material (optional RAG)")
+        st.caption(
+            "Upload a PDF once. VBCUA extracts its text, creates local embeddings, and stores the index in SQLite. "
+            "No PDF is sent to Gemini during ingestion."
+        )
+
+        pdf_file = st.file_uploader(
+            "PDF study material",
+            type=["pdf"],
+            key="rag_pdf_upload",
+            help="Use lecture notes, textbooks, handouts or other text-based study material.",
+        )
+
+        if pdf_file is not None:
+            pdf_bytes = pdf_file.getvalue()
+            pdf_mb = len(pdf_bytes) / (1024 * 1024)
+            st.caption(f"{pdf_file.name} · {pdf_mb:.2f} MB")
+            if pdf_mb > 20:
+                st.error("PDFs are limited to 20 MB in this phase.")
+            elif database is None:
+                st.error("The database is unavailable, so the PDF index cannot be stored.")
+            elif st.button("📚 Add PDF to knowledge base", width="stretch"):
+                with st.spinner("Extracting PDF and building local embeddings..."):
+                    try:
+                        info = ingest_pdf(
+                            database,
+                            pdf_bytes,
+                            pdf_file.name,
+                            settings.embedding_model,
+                        )
+                        st.success(
+                            f"Indexed {info['name']}: {info['pages']} page(s), {info['chunks']} searchable chunk(s)."
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"PDF indexing failed: {exc}")
+
+        documents = database.list_documents() if database is not None else []
+        document_options = {"None": None}
+        document_options.update({
+            f"{doc['name']} · {doc['chunk_count']} chunks": int(doc['id']) for doc in documents
+        })
+        selected_doc_label = st.selectbox(
+            "Indexed material",
+            list(document_options),
+            index=0,
+            help="Choose the material VBCUA should search for relevant evidence.",
+        )
+        selected_doc_id = document_options[selected_doc_label]
+
+        rag_query = st.text_input(
+            "Concept / question to retrieve",
+            value=st.session_state.get("rag_query", ""),
+            placeholder="e.g. Explain backpropagation and how weights are updated",
+        )
+
+        if selected_doc_id and rag_query.strip() and st.button("🔎 Retrieve relevant material", width="stretch"):
+            with st.spinner("Searching your study material..."):
+                hits = retrieve(
+                    database,
+                    rag_query,
+                    settings.embedding_model,
+                    document_id=selected_doc_id,
+                )
+            st.session_state.rag_document_id = selected_doc_id
+            st.session_state.rag_document_name = selected_doc_label.split(" · ")[0]
+            st.session_state.rag_query = rag_query.strip()
+            st.session_state.rag_context = build_context(hits)
+            st.session_state.rag_sources = [
+                {"document": h.document_name, "page": h.page, "score": round(h.score, 4), "text": h.text}
+                for h in hits
+            ]
+            if hits:
+                st.success(f"Retrieved {len(hits)} relevant passage(s).")
+            else:
+                st.warning("No relevant passages were retrieved.")
+
+        if st.session_state.get("rag_sources"):
+            with st.expander("Retrieved evidence", expanded=False):
+                for source in st.session_state["rag_sources"]:
+                    st.markdown(
+                        f"**{source['document']} · page {source['page']} · relevance {source['score']:.3f}**"
+                    )
+                    st.write(source["text"][:1200] + ("…" if len(source["text"]) > 1200 else ""))
+
+        st.markdown("### 3. Expected answer")
 
         expected_answer = st.text_area(
             "Reference answer",
@@ -154,6 +239,11 @@ def render(settings: Settings) -> None:
                 "audio_name",
                 "audio_hash",
                 "reference_answer",
+                "rag_document_id",
+                "rag_document_name",
+                "rag_query",
+                "rag_context",
+                "rag_sources",
                 "result",
             ):
                 st.session_state[key] = (
@@ -167,7 +257,7 @@ def render(settings: Settings) -> None:
 
     if (
         st.session_state.get("audio")
-        and st.session_state.get("reference_answer")
+        and (st.session_state.get("reference_answer") or st.session_state.get("rag_context"))
     ):
         st.success(
             "Input is ready. Open **AI Analysis** in the sidebar "
@@ -177,7 +267,7 @@ def render(settings: Settings) -> None:
         ui.empty_state(
             "Nothing saved yet",
             "Upload an audio file or record from the microphone, "
-            "then enter the expected answer and choose Save input.",
+            "then enter the expected answer and choose Save input. PDF retrieval is optional and can ground the next analysis.",
         )
 
 
@@ -198,11 +288,11 @@ def _save(
 
     reference = (expected_answer or "").strip()
 
-    if not reference:
-        st.warning("Please enter the expected answer.")
+    if not reference and not st.session_state.get("rag_context"):
+        st.warning("Please enter the expected answer or retrieve material from a PDF first.")
         return
 
-    if len(reference) < 15:
+    if reference and len(reference) < 15:
         st.warning(
             "The expected answer is too short. "
             "Please write at least one full sentence."

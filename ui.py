@@ -1025,6 +1025,21 @@ def render_result_details(
 
     bullet_columns(result)
 
+    concept_scores = _value(result, "concept_scores", []) or []
+    if concept_scores:
+        st.markdown("### Concept-level understanding")
+        topic = _value(result, "rag_topic", "")
+        if topic:
+            st.caption(f"Gemini topic model: {topic}")
+        for concept in concept_scores:
+            name = _escape(str(concept.get("name", "Concept")))
+            score = float(concept.get("score", 0))
+            page = concept.get("page")
+            source = f" · PDF page {page}" if page else ""
+            st.markdown(f"**{name}**{source} — **{score:.1f}%**")
+            st.progress(max(0.0, min(1.0, score / 100.0)))
+            st.caption(str(concept.get("description", "")))
+
     if show_transcript:
 
         st.markdown(

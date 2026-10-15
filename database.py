@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Columns expected on the modern ``results`` table.
 RESULT_COLUMNS = (
@@ -172,6 +172,37 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_results_created_at ON results(created_at DESC)"
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    file_hash TEXT NOT NULL UNIQUE,
+                    page_count INTEGER NOT NULL DEFAULT 0,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    embedding_model TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS document_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id INTEGER NOT NULL,
+                    page INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+                )
+                """
+            )
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id)"
+            )
+
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_api_usage_called_at ON api_usage(provider, called_at)"
             )
             conn.execute(
@@ -280,6 +311,78 @@ class Database:
                 data[numeric] = None
 
         return data
+
+    # ------------------------------------------------------------------
+    # Local RAG document store
+    # ------------------------------------------------------------------
+    def upsert_document(
+        self,
+        name: str,
+        file_hash: str,
+        page_count: int,
+        chunk_count: int,
+        embedding_model: str,
+    ) -> int:
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM documents WHERE file_hash = ?", (file_hash,)
+            ).fetchone()
+            if existing:
+                document_id = int(existing["id"])
+                conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+                conn.execute(
+                    """UPDATE documents SET name=?, page_count=?, chunk_count=?, embedding_model=?, created_at=?
+                       WHERE id=?""",
+                    (name, page_count, chunk_count, embedding_model, _utcnow(), document_id),
+                )
+                return document_id
+
+            cursor = conn.execute(
+                """INSERT INTO documents
+                   (name, file_hash, page_count, chunk_count, embedding_model, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name, file_hash, page_count, chunk_count, embedding_model, _utcnow()),
+            )
+            return int(cursor.lastrowid)
+
+    def replace_document_chunks(self, document_id: int, chunks: Iterable[tuple[int, str, list[float]]]) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (int(document_id),))
+            conn.executemany(
+                "INSERT INTO document_chunks(document_id, page, text, embedding) VALUES (?, ?, ?, ?)",
+                [(int(document_id), int(page), text, json.dumps(vector)) for page, text, vector in chunks],
+            )
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM documents ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_document_chunks(self, document_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        query = """SELECT c.id, c.document_id, d.name AS document_name, c.page, c.text, c.embedding
+                   FROM document_chunks c JOIN documents d ON d.id = c.document_id"""
+        params: tuple[Any, ...] = ()
+        if document_id is not None:
+            query += " WHERE c.document_id = ?"
+            params = (int(document_id),)
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["embedding"] = json.loads(item["embedding"])
+            except (TypeError, json.JSONDecodeError):
+                item["embedding"] = []
+            result.append(item)
+        return result
+
+    def delete_document(self, document_id: int) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM documents WHERE id = ?", (int(document_id),))
+            return cursor.rowcount > 0
 
     # ------------------------------------------------------------------
     # Transcript cache (saves CPU time, keeps Whisper runs to a minimum)

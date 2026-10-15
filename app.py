@@ -15,7 +15,6 @@ Run with:  streamlit run "Source Code/app.py"
 """
 
 from __future__ import annotations
-
 import logging
 import os
 import sys
@@ -33,6 +32,8 @@ import results as results_page  # noqa: E402
 import transcription  # noqa: E402
 import ui  # noqa: E402
 import upload as upload_page  # noqa: E402
+import tutor  # noqa: E402
+import realtime_mode
 from analysis import AnalysisError, analyse  # noqa: E402
 from config import load_settings  # noqa: E402
 from database import get_database  # noqa: E402
@@ -98,7 +99,22 @@ DEFAULT_STATE = {
     "audio_name": "",
     "audio_hash": "",
     "reference_answer": "",
+    "rag_document_id": None,
+    "rag_document_name": "",
+    "rag_query": "",
+    "rag_context": "",
+    "rag_sources": [],
     "result": None,
+    "tutor_mode": False,
+    "tutor_concepts": [],
+    "tutor_scores": [],
+    "tutor_current": None,
+    "tutor_question": "",
+    "tutor_round": 0,
+    "tutor_history": [],
+    "tutor_answer_audio": None,
+    "tutor_answer_hash": "",
+    "tutor_answer_text": "",
 }
 for _key, _value in DEFAULT_STATE.items():
     st.session_state.setdefault(_key, _value)
@@ -119,7 +135,16 @@ def render_sidebar() -> str:
 
     page = st.sidebar.radio(
         "Navigation",
-        ["🏠 Home", "🎤 Upload Audio", "🧠 AI Analysis", "📊 Dashboard", "📄 Report", "🗂 History"],
+        [
+    "🏠 Home",
+    "🎤 Upload Audio",
+    "🧠 AI Analysis",
+    "🧑‍🏫 Tutor Mode",
+    "🔴 Real-time Mode",
+    "📊 Dashboard",
+    "📄 Report",
+    "🗂 History",
+        ],
         label_visibility="collapsed",
     )
 
@@ -167,6 +192,17 @@ def render_sidebar() -> str:
             logger.debug("Could not read API usage", exc_info=True)
 
     st.sidebar.divider()
+    tutor_enabled = st.sidebar.toggle(
+        "🧑‍🏫 Tutor Mode",
+        value=bool(st.session_state.get("tutor_mode", False)),
+        help="Turn the Socratic follow-up tutor on or off. Your normal evaluator remains unchanged when off.",
+    )
+    if tutor_enabled != st.session_state.get("tutor_mode", False):
+        st.session_state.tutor_mode = tutor_enabled
+        if not tutor_enabled:
+            st.session_state.tutor_question = ""
+            st.session_state.tutor_current = None
+        st.rerun()
     st.sidebar.caption("APSCHE Internship 2026 · Google Cloud Generative AI")
     return page
 
@@ -251,7 +287,8 @@ PROGRESS_STEPS = {
     "Analysing audio signal...": 15,
     "Converting speech to text with Whisper...": 45,
     "Measuring semantic similarity...": 70,
-    "Requesting AI feedback from Gemini...": 85,
+    "Building RAG-grounded concept map with Gemini...": 78,
+    "Requesting AI feedback from Gemini...": 88,
     "Saving results...": 95,
     "Done.": 100,
 }
@@ -263,9 +300,9 @@ def page_analysis() -> None:
     if not st.session_state.get("audio"):
         ui.empty_state("No audio saved", "Upload a recording on the Upload Audio page first.")
         return
-    if not (st.session_state.get("reference_answer") or "").strip():
+    if not (st.session_state.get("reference_answer") or "").strip() and not st.session_state.get("rag_context"):
         ui.empty_state(
-            "No expected answer", "Enter the expected answer on the Upload Audio page first."
+            "No evaluation source", "Enter an expected answer or retrieve study material from a PDF first."
         )
         return
 
@@ -273,8 +310,15 @@ def page_analysis() -> None:
     with col_info:
         st.markdown(
             f"**Recording:** {st.session_state.get('audio_name', 'recording')}  \n"
-            f"**Expected answer:** {len(st.session_state['reference_answer'].split())} words"
+            f"**Expected answer:** {len(st.session_state.get('reference_answer', '').split())} words"
         )
+        if st.session_state.get("rag_context"):
+            st.success(
+                f"RAG grounding active: {st.session_state.get('rag_document_name', 'study material')} "
+                f"→ {st.session_state.get('rag_query', 'retrieved concept')}"
+            )
+            with st.expander("View retrieved study material", expanded=False):
+                st.write(st.session_state["rag_context"])
     with col_run:
         run = st.button("Run analysis", type="primary", width="stretch")
 
@@ -303,7 +347,9 @@ def page_analysis() -> None:
         result = analyse(
             st.session_state["audio"],
             st.session_state.get("audio_name", "recording.wav"),
-            st.session_state["reference_answer"],
+            st.session_state.get("reference_answer", ""),
+            rag_context=st.session_state.get("rag_context", ""),
+            rag_query=st.session_state.get("rag_query", ""),
             settings=settings,
             database=database,
             progress=progress,
@@ -333,6 +379,102 @@ def page_analysis() -> None:
 
     st.markdown("")
     st.info("Open the **Dashboard** for charts, or the **Report** page to download the PDF.")
+
+
+def page_tutor() -> None:
+    ui.hero("Tutor Mode", "A grounded Socratic loop that targets the concepts your explanation needs to demonstrate.")
+    if not st.session_state.get("tutor_mode"):
+        st.info("Tutor Mode is OFF. Turn it on from the sidebar to start targeted follow-up questions.")
+        return
+    result = st.session_state.get("result")
+    if result is None:
+        st.warning("Run the normal AI Analysis first. Tutor Mode uses that transcript and its concept map.")
+        return
+    if not getattr(result, "concepts", None):
+        st.warning("No concept map is available yet. In Tutor Mode, use a PDF + retrieval query, then run AI Analysis.")
+        return
+
+    if not st.session_state.get("tutor_concepts"):
+        st.session_state.tutor_concepts = list(result.concepts)
+        st.session_state.tutor_scores = tutor.score_concepts(
+            st.session_state.tutor_concepts, result.transcript, settings.embedding_model
+        )
+        st.session_state.tutor_round = 0
+        st.session_state.tutor_history = []
+
+    scores = st.session_state.tutor_scores
+    st.markdown("### Concept mastery")
+    for item in scores:
+        score = float(item.get("score", 0))
+        st.progress(max(0.0, min(1.0, score / 100.0)), text=f"{item.get('name', 'Concept')} · {score:.0f}/100")
+
+    if st.session_state.tutor_round >= 3:
+        st.success("Tutor session complete — 3 targeted rounds reached.")
+        return
+
+    if st.session_state.tutor_current is None:
+        asked = {str(x.get("concept", "")) for x in st.session_state.tutor_history}
+        current = tutor.weakest_concept(scores, asked)
+        if current is None:
+            st.success("All extracted concepts have been covered.")
+            return
+        st.session_state.tutor_current = current
+        st.session_state.tutor_question = tutor.generate_question(
+            concept=current,
+            study_context=st.session_state.get("rag_context", ""),
+            settings=settings, database=database,
+        )
+
+    current = st.session_state.tutor_current
+    st.markdown(f"### Round {st.session_state.tutor_round + 1}/3")
+    st.info(st.session_state.tutor_question)
+    followup = st.audio_input("Answer the tutor by voice", key=f"tutor_audio_{st.session_state.tutor_round}")
+    if followup is not None and st.button("Evaluate follow-up", type="primary"):
+        audio_bytes = followup.getvalue()
+        try:
+            from database import sha256_bytes
+            from transcription import transcribe_bytes, TranscriptionError
+            audio_hash = sha256_bytes(audio_bytes)
+            tr = transcribe_bytes(audio_bytes, "tutor_followup.wav", model_name=settings.whisper_model, database=database, audio_hash=audio_hash)
+            answer = tr.text.strip()
+            if not answer:
+                st.error("Whisper produced an empty follow-up transcript.")
+                return
+            evaluation = tutor.evaluate_followup(
+                concept=current, answer=answer,
+                study_context=st.session_state.get("rag_context", ""),
+                settings=settings, database=database,
+            )
+            local = tutor.score_concepts([current], answer, settings.embedding_model)[0]
+            combined_score = float(evaluation.get("score", local["score"]))
+            st.session_state.tutor_history.append({
+                "concept": current.get("name", "Concept"),
+                "question": st.session_state.tutor_question,
+                "answer": answer,
+                "score": combined_score,
+                "feedback": evaluation.get("feedback", ""),
+            })
+            st.success(f"Follow-up score: {combined_score:.0f}/100")
+            st.write(evaluation.get("feedback", ""))
+            if evaluation.get("missing"):
+                st.caption("Still missing: " + ", ".join(map(str, evaluation["missing"])))
+            st.session_state.tutor_round += 1
+            st.session_state.tutor_current = None
+            st.session_state.tutor_question = ""
+            st.rerun()
+        except TranscriptionError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            logger.exception("Tutor follow-up failed")
+            st.error(f"Tutor follow-up could not be evaluated: {exc}")
+
+    if st.session_state.tutor_history:
+        with st.expander("Tutor session history", expanded=False):
+            for i, item in enumerate(st.session_state.tutor_history, 1):
+                st.markdown(f"**Round {i}: {item['concept']} — {float(item['score']):.0f}/100**")
+                st.write(item["answer"])
+                if item.get("feedback"):
+                    st.caption(item["feedback"])
 
 
 def page_report() -> None:
@@ -384,9 +526,13 @@ def main() -> None:
     if page == "🏠 Home":
         page_home()
     elif page == "🎤 Upload Audio":
-        upload_page.render(settings)
+        upload_page.render(settings, database)
     elif page == "🧠 AI Analysis":
         page_analysis()
+    elif page == "🧑‍🏫 Tutor Mode":
+        page_tutor()
+    elif page == "🔴 Real-time Mode":
+         realtime_mode.render_realtime_panel()
     elif page == "📊 Dashboard":
         if database is None:
             st.error("The dashboard needs the results database, which could not be opened.")

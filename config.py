@@ -189,12 +189,12 @@ def _get_bool(name: str, default: bool) -> bool:
 # Do NOT add the old 2.0/1.5 models here.
 
 DEFAULT_GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.5-flash",
     "gemini-2.5-flash-lite",
 ]
-
 
 # ============================================================================
 # Application settings
@@ -217,7 +217,7 @@ class Settings:
     )
 
     # Number of retry attempts for temporary provider errors.
-    gemini_retry_attempts: int = 2
+    gemini_retry_attempts: int = 1
 
     # Initial delay between retry attempts.
     gemini_retry_delay_seconds: float = 1.5
@@ -309,7 +309,12 @@ def load_settings() -> Settings:
     # Gemini models
     # ----------------------------------------------------------------------
 
+    # Prefer the new comma-separated setting. Keep GEMINI_MODEL for
+    # backwards compatibility with existing .env files.
     models_raw = get_setting(
+        "GEMINI_MODELS",
+        "",
+    ) or get_setting(
         "GEMINI_MODEL",
         "",
     )
@@ -323,7 +328,14 @@ def load_settings() -> Settings:
             if model.strip()
         )
 
-    # Always append the current supported models.
+    # Drop the retired 2.5 Flash ID if an older .env still contains it.
+    models = [
+        model
+        for model in models
+        if model != "gemini-2.5-flash"
+    ]
+
+    # Always append the current fallback models.
     for model in DEFAULT_GEMINI_MODELS:
         if model not in models:
             models.append(model)
@@ -395,7 +407,7 @@ def load_settings() -> Settings:
             0,
             _get_int(
                 "GEMINI_RETRY_ATTEMPTS",
-                2,
+                1,
             ),
         ),
 

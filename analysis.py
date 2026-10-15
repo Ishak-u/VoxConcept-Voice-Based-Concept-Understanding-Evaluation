@@ -59,6 +59,9 @@ class AnalysisResult:
     transcription_model: str = "base"
     transcript_cached: bool = False
     notices: List[str] = field(default_factory=list)
+    concepts: List[Dict[str, Any]] = field(default_factory=list)
+    concept_scores: List[Dict[str, Any]] = field(default_factory=list)
+    rag_topic: str = ""
     result_id: Optional[int] = None
 
     def to_record(self) -> Dict[str, Any]:
@@ -139,16 +142,67 @@ def _feedback_from_gemini(
         return None
 
 
+def _concept_analysis(
+    rag_context: str,
+    rag_query: str,
+    transcript: str,
+    settings: Settings,
+    database: Database,
+) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Use Gemini to extract RAG-grounded concepts, then score each locally."""
+    if not rag_context.strip() or not rag_query.strip() or not settings.gemini_enabled:
+        return "", [], []
+    try:
+        from gemini_client import GeminiError, generate_concepts
+        concept_data = generate_concepts(
+            study_context=rag_context,
+            query=rag_query,
+            settings=settings,
+            database=database,
+        )
+    except Exception as exc:
+        logger.info("Phase 2 concept extraction unavailable: %s", exc)
+        return "", [], []
+
+    concepts = concept_data.get("concepts", [])
+    scored: List[Dict[str, Any]] = []
+    for concept in concepts:
+        description = str(concept.get("description", "")).strip()
+        if not description:
+            continue
+        sim = compute_similarity(
+            description,
+            transcript,
+            model_name=settings.embedding_model,
+            allow_embeddings=True,
+        )
+        score = round(float(sim.similarity) * 100, 1)
+        scored.append({
+            "name": str(concept.get("name", "Concept")),
+            "description": description,
+            "page": concept.get("page"),
+            "score": score,
+            "method": sim.method,
+        })
+    return str(concept_data.get("topic", "")), list(concepts), scored
+
+
 def analyse(
     audio_bytes: bytes,
     audio_name: str,
     reference_answer: str,
     *,
+    rag_context: str = "",
+    rag_query: str = "",
     settings: Settings,
     database: Database,
     progress: ProgressCallback = None,
 ) -> AnalysisResult:
     """Run one complete evaluation and persist it in SQLite."""
+    if not (reference_answer or "").strip() and not rag_context.strip():
+        raise AnalysisError("Please provide an expected answer or retrieve study material from a PDF first.")
+    if not (reference_answer or "").strip() and rag_context.strip():
+        reference_answer = rag_context
     _validate_inputs(audio_bytes, reference_answer, settings)
     reference_answer = reference_answer.strip()
     audio_name = audio_name or "recording.wav"
@@ -211,6 +265,19 @@ def analyse(
     )
     grade = grade_for_score(score)
 
+    concepts: List[Dict[str, Any]] = []
+    concept_scores: List[Dict[str, Any]] = []
+    rag_topic = ""
+    if rag_context.strip() and rag_query.strip() and settings.gemini_enabled:
+        _notify(progress, "Building RAG-grounded concept map with Gemini...")
+        rag_topic, concepts, concept_scores = _concept_analysis(
+            rag_context, rag_query, transcription.text, settings, database
+        )
+        if concepts:
+            notices.append(f"Gemini extracted {len(concepts)} RAG-grounded concepts for concept-level scoring.")
+        else:
+            notices.append("Gemini concept extraction was unavailable; the overall evaluator was used.")
+
     _notify(progress, "Requesting AI feedback from Gemini...")
     feedback = _feedback_from_gemini(
         reference_answer,
@@ -261,6 +328,9 @@ def analyse(
         transcription_model=transcription.model,
         transcript_cached=transcription.cached,
         notices=notices,
+        concepts=concepts,
+        concept_scores=concept_scores,
+        rag_topic=rag_topic,
     )
 
     try:

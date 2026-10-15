@@ -5,12 +5,10 @@ Uses Google's modern ``google-genai`` SDK.
 
 Features:
 
-- Gemini 3.6 Flash
-- Gemini 3.5 Flash-Lite
-- Gemini 2.5 Flash
-- Gemini 2.5 Flash-Lite
+- Current Gemini 3.x Flash models with fallback
+- Gemini Flash-Lite fallback
 - Automatic fallback between models
-- Automatic retry for temporary 429/503 errors
+- Limited retry for temporary 429/503 errors
 - Structured JSON output
 - SQLite response caching
 - Local per-minute and daily rate limits
@@ -32,6 +30,10 @@ from database import Database, sha256_text
 
 
 logger = logging.getLogger(__name__)
+
+
+# Keep provider retries small. Model fallback handles temporary outages.
+DEFAULT_PROVIDER_RETRY_ATTEMPTS = 1
 
 
 # ============================================================================
@@ -115,6 +117,121 @@ Rules:
 7. Strengths, weaknesses and suggestions should be short.
 8. Return valid JSON matching the requested schema.
 """.strip()
+
+
+def _concept_prompt(study_context: str, query: str) -> str:
+    return f"""
+You are building a concept map for a voice-based academic evaluator.
+Use ONLY the supplied study material. Do not add outside facts.
+
+Student's concept/question:
+{query}
+
+Retrieved study material:
+{study_context}
+
+Extract the key concepts that a student should demonstrate when explaining this topic.
+Return 3 to 8 concepts. Each concept must be atomic enough to score independently.
+For each concept provide a concise, source-grounded description of what a correct explanation
+should contain. Include a source page when it is clear from the supplied source labels.
+
+Return JSON with exactly:
+{{
+  "topic": "...",
+  "concepts": [
+    {{"name": "...", "description": "...", "page": 1}}
+  ]
+}}
+
+Do not invent concepts that are not supported by the retrieved study material.
+""".strip()
+
+
+def _parse_concepts(text: str) -> Dict[str, object]:
+    candidate = _extract_json_object(text)
+    if not candidate:
+        raise GeminiError("Gemini returned a response that was not valid concept JSON.")
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise GeminiError("Gemini returned malformed concept JSON.") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("concepts"), list):
+        raise GeminiError("Gemini concept response did not contain a concepts array.")
+    concepts = []
+    for item in parsed["concepts"]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not name or not description:
+            continue
+        page = item.get("page")
+        try:
+            page = int(page) if page is not None else None
+        except (TypeError, ValueError):
+            page = None
+        concepts.append({"name": name, "description": description, "page": page})
+    if not concepts:
+        raise GeminiError("Gemini returned no usable concepts.")
+    return {"topic": str(parsed.get("topic", "")).strip(), "concepts": concepts[:8]}
+
+
+def generate_concepts(
+    *,
+    study_context: str,
+    query: str,
+    settings: Settings,
+    database: Database,
+) -> Dict[str, object]:
+    """Extract a grounded concept map from retrieved RAG evidence."""
+    if not settings.gemini_enabled or not settings.gemini_api_key:
+        raise GeminiError("Gemini is not configured.")
+    if not settings.gemini_models:
+        raise GeminiError("No Gemini models are configured.")
+    if not study_context.strip():
+        raise GeminiError("No retrieved study material was supplied to Gemini.")
+
+    prompt = _concept_prompt(study_context, query)
+    prompt_hash = sha256_text("phase2-concepts\n" + prompt)
+    try:
+        cached = database.get_cached_ai_response(prompt_hash, settings.ai_cache_ttl_hours)
+    except Exception:
+        cached = None
+    if cached:
+        return _parse_concepts(cached)
+
+    try:
+        if database.count_api_calls("gemini", 60) >= settings.gemini_calls_per_minute:
+            raise GeminiError("The local Gemini per-minute rate limit has been reached.")
+        if database.count_api_calls("gemini", 86400) >= settings.gemini_calls_per_day:
+            raise GeminiError("The local Gemini daily rate limit has been reached.")
+    except GeminiError:
+        raise
+    except Exception:
+        pass
+
+    schema_prompt = prompt
+    last_error = None
+    for model in settings.gemini_models:
+        try:
+            raw = _call_google_genai(
+                api_key=settings.gemini_api_key,
+                model=model,
+                prompt=schema_prompt,
+                retry_attempts=settings.gemini_retry_attempts,
+                retry_delay_seconds=settings.gemini_retry_delay_seconds,
+            )
+            result = _parse_concepts(raw)
+            try:
+                database.record_api_call("gemini")
+                database.cache_ai_response(prompt_hash, raw, model)
+            except Exception as exc:
+                logger.warning("Could not persist Gemini concept response: %s", exc)
+            return result
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Gemini concept extraction failed with %s: %s", model, exc)
+    raise GeminiError(str(last_error or "No Gemini model could extract concepts."))
 
 
 # ============================================================================
@@ -484,7 +601,7 @@ def _call_google_genai(
     api_key: str,
     model: str,
     prompt: str,
-    retry_attempts: int = 2,
+    retry_attempts: int = DEFAULT_PROVIDER_RETRY_ATTEMPTS,
     retry_delay_seconds: float = 1.5,
 ) -> str:
     """
@@ -516,38 +633,37 @@ def _call_google_genai(
     # Structured output schema
     # ----------------------------------------------------------------------
 
-    response_schema = {
-        "type": "OBJECT",
-        "properties": {
-            "summary": {
-                "type": "STRING",
-            },
-            "strengths": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "STRING",
+    if "concepts" in prompt and "source page" in prompt:
+        response_schema = {
+            "type": "OBJECT",
+            "properties": {
+                "topic": {"type": "STRING"},
+                "concepts": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "name": {"type": "STRING"},
+                            "description": {"type": "STRING"},
+                            "page": {"type": "INTEGER"},
+                        },
+                        "required": ["name", "description", "page"],
+                    },
                 },
             },
-            "weaknesses": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "STRING",
-                },
+            "required": ["topic", "concepts"],
+        }
+    else:
+        response_schema = {
+            "type": "OBJECT",
+            "properties": {
+                "summary": {"type": "STRING"},
+                "strengths": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "weaknesses": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "suggestions": {"type": "ARRAY", "items": {"type": "STRING"}},
             },
-            "suggestions": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "STRING",
-                },
-            },
-        },
-        "required": [
-            "summary",
-            "strengths",
-            "weaknesses",
-            "suggestions",
-        ],
-    }
+            "required": ["summary", "strengths", "weaknesses", "suggestions"],
+        }
 
     # ----------------------------------------------------------------------
     # Generation config
@@ -644,8 +760,8 @@ def _call_google_genai(
                     continue
 
                 raise GeminiError(
-                    f"Gemini request failed after "
-                    f"{attempts + 1} attempts: {exc}"
+                    f"Gemini model {model} is temporarily unavailable after "
+                    f"{attempts + 1} attempt(s): {exc}"
                 ) from exc
 
             # --------------------------------------------------------------
@@ -680,12 +796,7 @@ def generate_feedback(
 
     Model order comes from settings.gemini_models.
 
-    Example:
-
-        gemini-3.6-flash
-        gemini-3.5-flash-lite
-        gemini-2.5-flash
-        gemini-2.5-flash-lite
+    The current fallback order comes from settings.gemini_models.
     """
 
     # =========================================================================
@@ -904,4 +1015,68 @@ def generate_feedback(
 __all__ = [
     "GeminiError",
     "generate_feedback",
+    "generate_concepts",
 ]
+# ============================================================================
+# Tutor Mode generation
+# ============================================================================
+
+def _tutor_json(prompt: str, settings: Settings, database: Database, cache_prefix: str) -> Dict[str, object]:
+    if not settings.gemini_enabled or not settings.gemini_api_key:
+        raise GeminiError("Gemini is not configured.")
+    prompt_hash = sha256_text(cache_prefix + "\n" + prompt)
+    try:
+        cached = database.get_cached_ai_response(prompt_hash, settings.ai_cache_ttl_hours)
+    except Exception:
+        cached = None
+    if cached:
+        return _parse_json(cached)
+    if database.count_api_calls("gemini", 60) >= settings.gemini_calls_per_minute:
+        raise GeminiError("The local Gemini per-minute rate limit has been reached.")
+    if database.count_api_calls("gemini", 86400) >= settings.gemini_calls_per_day:
+        raise GeminiError("The local Gemini daily rate limit has been reached.")
+    last_error = None
+    for model in settings.gemini_models:
+        try:
+            raw = _call_google_genai(api_key=settings.gemini_api_key, model=model, prompt=prompt,
+                                     retry_attempts=settings.gemini_retry_attempts,
+                                     retry_delay_seconds=settings.gemini_retry_delay_seconds)
+            parsed = _parse_json(raw)
+            database.record_api_call("gemini")
+            database.cache_ai_response(prompt_hash, raw, model)
+            return parsed
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Tutor Gemini call failed with %s: %s", model, exc)
+    raise GeminiError(str(last_error or "Tutor Gemini request failed."))
+
+
+def generate_tutor_question(*, concept: Dict[str, object], study_context: str, settings: Settings, database: Database) -> Dict[str, object]:
+    prompt = f"""
+You are a Socratic academic tutor. Use ONLY the supplied study material.
+Concept: {concept.get('name')}
+What a correct explanation should contain: {concept.get('description')}
+Study material:
+{study_context}
+
+Ask exactly ONE short, open-ended question that tests whether the student understands this concept.
+Do not give the answer. Do not introduce facts absent from the study material.
+Return JSON: {{"question":"..."}}
+""".strip()
+    return _tutor_json(prompt, settings, database, "tutor-question-v1")
+
+
+def evaluate_tutor_answer(*, concept: Dict[str, object], answer: str, study_context: str, settings: Settings, database: Database) -> Dict[str, object]:
+    prompt = f"""
+Evaluate a student's follow-up answer using ONLY the supplied study material.
+Concept: {concept.get('name')}
+Expected concept content: {concept.get('description')}
+Study material:
+{study_context}
+Student answer:
+{answer}
+
+Return JSON exactly with: correct (boolean), score (0-100 number), feedback (one concise sentence), missing (array of short strings).
+Do not invent missing details; missing means absent from the expected concept content.
+""".strip()
+    return _tutor_json(prompt, settings, database, "tutor-answer-v1")
